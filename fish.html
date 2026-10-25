@@ -1578,13 +1578,13 @@
           }
           // Fetch live Pixel ID from Supabase system_preferences (settable via Telegram /pixel)
           const supaKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzcWh2dWpxbW54cXJkb292dm5wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTc4NjAsImV4cCI6MjA2OTg3Mzg2MH0.3kCGGAe1OoSJ_SCN_NDSdnKep1hXIMgMxR1lBd_i2eI';
-          fetch('https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/system_preferences?key=eq.meta_pixel_config&select=value', {
+          fetch('https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/public_meta_pixel?select=pixel_id', {
             headers: { 'apikey': supaKey, 'Authorization': 'Bearer ' + supaKey }
           })
           .then(r => r.ok ? r.json() : [])
           .then(rows => {
-            if (Array.isArray(rows) && rows.length > 0 && rows[0].value && rows[0].value.pixel_id) {
-              const livePixel = String(rows[0].value.pixel_id).trim();
+            if (Array.isArray(rows) && rows.length > 0 && rows[0].pixel_id) {
+              const livePixel = String(rows[0].pixel_id).trim();
               if (/^\d{10,20}$/.test(livePixel)) {
                 localStorage.setItem('pkf_pixel_id', livePixel);
                 loadFbPixelScript(livePixel);
@@ -1646,7 +1646,7 @@
       if (!ticker) return;
 
       try {
-        const res = await fetch('https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/direct_orders?select=customer_name,package_name,created_at,address&order=created_at.desc&limit=10', {
+        const res = await fetch('https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/order_ticker?select=masked_name,province,package_name,created_at', {
           headers: {
             'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzcWh2dWpxbW54cXJkb292dm5wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTc4NjAsImV4cCI6MjA2OTg3Mzg2MH0.3kCGGAe1OoSJ_SCN_NDSdnKep1hXIMgMxR1lBd_i2eI',
             'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzcWh2dWpxbW54cXJkb292dm5wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTc4NjAsImV4cCI6MjA2OTg3Mzg2MH0.3kCGGAe1OoSJ_SCN_NDSdnKep1hXIMgMxR1lBd_i2eI'
@@ -1674,7 +1674,7 @@
       if (!ticker || liveRealOrders.length === 0) return;
 
       const order = liveRealOrders[realTickerIdx];
-      const maskedName = maskCustomerName(order.customer_name) + extractProvince(order.address);
+      const maskedName = (order.masked_name || "คุณลูกค้า") + (order.province ? " (" + order.province + ")" : "");
       const pkg = order.package_name || "ปลาแดดเดียว คัดพิเศษ";
       const timeAgo = formatRelativeTime(order.created_at);
 
