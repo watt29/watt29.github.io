@@ -83,6 +83,8 @@
     }
   }
 
+  </script>
+  <script>
     function selectEmotion(type) {
       document.querySelectorAll('.emotion-btn').forEach(btn => btn.classList.remove('active'));
       const resBox = document.getElementById('emotionResultBox');
@@ -1334,6 +1336,85 @@
       return null;
     }
 
+    // =========================================================================
+    // Order Delivery Guarantee: Supabase → GAS fallback → local retry queue
+    // =========================================================================
+    const PKF_SUPA_URL = 'https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/direct_orders';
+    const PKF_SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzcWh2dWpxbW54cXJkb292dm5wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTc4NjAsImV4cCI6MjA2OTg3Mzg2MH0.3kCGGAe1OoSJ_SCN_NDSdnKep1hXIMgMxR1lBd_i2eI';
+    const PKF_GAS_URL = 'https://script.google.com/macros/s/AKfycbxHAfBm0V67wkiXb1dlAFNbG3NQudcN35zuQ3xjFo0FRHY2ja8TB3-Xj0l_xOWxeF404Q/exec';
+    const PKF_QUEUE_KEY = 'pkf_pending_orders';
+
+    function pkfFetchWithTimeout(url, opts, ms) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), ms);
+      return fetch(url, Object.assign({}, opts, { signal: ctrl.signal })).finally(() => clearTimeout(timer));
+    }
+
+    async function pkfSaveOrderToSupabase(row) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await pkfFetchWithTimeout(PKF_SUPA_URL, {
+            method: 'POST',
+            headers: {
+              'apikey': PKF_SUPA_KEY,
+              'Authorization': 'Bearer ' + PKF_SUPA_KEY,
+              'Content-Type': 'application/json',
+              'Prefer': 'return=minimal'
+            },
+            body: JSON.stringify(row)
+          }, 8000);
+          if (res.ok || res.status === 409) return true; // 409 = order_code นี้ถูกบันทึกไปแล้ว (ส่งซ้ำ) ถือว่าสำเร็จ
+          if (res.status >= 400 && res.status < 500) return false; // ข้อมูลผิด ไม่ต้องลองซ้ำ
+        } catch (e) { console.log('Supabase save attempt failed:', e); }
+        await new Promise(r => setTimeout(r, 800));
+      }
+      return false;
+    }
+
+    async function pkfPostOrderToGas(payload, needConfirm) {
+      const body = JSON.stringify(payload);
+      if (!needConfirm) {
+        // บันทึกหลักสำเร็จแล้ว: ส่งแจ้งเตือนแบบไม่ต้องรอ
+        const p = fetch(PKF_GAS_URL, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body }).catch(() => {});
+        await Promise.race([p, new Promise(r => setTimeout(r, 1500))]);
+        return true;
+      }
+      try {
+        const res = await pkfFetchWithTimeout(PKF_GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body }, 15000);
+        const data = await res.json();
+        return !!(data && data.ok && data.saved !== false);
+      } catch (e) {
+        console.log('GAS fallback failed:', e);
+        return false;
+      }
+    }
+
+    function pkfQueuePendingOrder(row, payload) {
+      try {
+        const q = JSON.parse(localStorage.getItem(PKF_QUEUE_KEY) || '[]');
+        if (!q.some(x => x.row && x.row.order_code === row.order_code)) q.push({ row, payload, ts: Date.now() });
+        localStorage.setItem(PKF_QUEUE_KEY, JSON.stringify(q));
+      } catch (e) {}
+    }
+
+    async function pkfFlushPendingOrders() {
+      let q;
+      try { q = JSON.parse(localStorage.getItem(PKF_QUEUE_KEY) || '[]'); } catch (e) { q = []; }
+      if (!q.length) return;
+      const remain = [];
+      for (const item of q) {
+        if (!item || !item.row) continue;
+        if (Date.now() - (item.ts || 0) > 7 * 24 * 3600 * 1000) continue; // เก่ากว่า 7 วัน ทิ้ง
+        let ok = await pkfSaveOrderToSupabase(item.row);
+        const pl = Object.assign({}, item.payload, { skip_db: ok, retry_from_queue: true });
+        const gasOk = await pkfPostOrderToGas(pl, !ok);
+        if (!ok && gasOk) ok = true;
+        if (!ok) remain.push(item);
+      }
+      localStorage.setItem(PKF_QUEUE_KEY, JSON.stringify(remain));
+    }
+    setTimeout(() => { pkfFlushPendingOrders(); }, 2500);
+
     let isSubmitting = false;
 
     async function submitOrder(e) {
@@ -1390,53 +1471,36 @@
       };
 
       try {
-        // 1. Supabase Direct Insert (Single Ground Truth Insert)
-        const supaUrl = 'https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/direct_orders';
-        const supaKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzcWh2dWpxbW54cXJkb292dm5wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTc4NjAsImV4cCI6MjA2OTg3Mzg2MH0.3kCGGAe1OoSJ_SCN_NDSdnKep1hXIMgMxR1lBd_i2eI';
-        
-        const supaPromise = fetch(supaUrl, {
-          method: 'POST',
-          headers: {
-            'apikey': supaKey,
-            'Authorization': 'Bearer ' + supaKey,
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-          },
-          body: JSON.stringify({
-            order_code: orderId,
-            product_name: p.name,
-            package_code: p.sku,
-            package_name: p.name,
-            price: p.price + (p.shippingFee || 0),
-            customer_name: name,
-            phone: phone,
-            address: address,
-            payment_method: currentPayment,
-            status: 'PENDING',
-            note: note || null,
-            slip_url: uploadedSlipUrl,
-            created_at: now.toISOString()
-          })
-        }).catch(err => console.log('Supa error:', err));
-
-        // 2. Google Apps Script Webhook (Telegram Push Alert + Meta CAPI Server Event)
-        const gasUrl = 'https://script.google.com/macros/s/AKfycbxHAfBm0V67wkiXb1dlAFNbG3NQudcN35zuQ3xjFo0FRHY2ja8TB3-Xj0l_xOWxeF404Q/exec';
-        const gasPromise = fetch(gasUrl, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify(payload)
-        }).catch(err => console.log('GAS error:', err));
-
-        // Wait max 800ms
-        await Promise.race([
-          Promise.all([supaPromise, gasPromise]),
-          new Promise(resolve => setTimeout(resolve, 800))
-        ]);
-
-        // 3. Fire Meta Pixel Purchase Event (Deduplicated with Server CAPI via orderId)
         const totalPay = p.price + (p.shippingFee || 0);
-        if (typeof window.pkfTrackMetaEvent === 'function') {
+        const orderRow = {
+          order_code: orderId,
+          product_name: p.name,
+          package_code: p.sku,
+          package_name: p.name,
+          price: totalPay,
+          customer_name: name,
+          phone: phone,
+          address: address,
+          payment_method: currentPayment,
+          status: 'PENDING',
+          note: note || null,
+          slip_url: uploadedSlipUrl,
+          created_at: now.toISOString()
+        };
+
+        // 1. Primary: บันทึกตรงเข้า Supabase (รอผลจริง ไม่เดา)
+        let saved = await pkfSaveOrderToSupabase(orderRow);
+
+        // 2. GAS: แจ้ง Telegram + CAPI | ถ้าข้อ 1 ล้มเหลว ให้ GAS บันทึกแทนด้วยคีย์ฝั่งเซิร์ฟเวอร์ และรอยืนยัน
+        payload.skip_db = saved;
+        const gasOk = await pkfPostOrderToGas(payload, !saved);
+        if (!saved && gasOk) saved = true;
+
+        // 3. ทั้งสองทางล้มเหลว → เก็บคิวไว้ในเครื่องลูกค้า แล้วส่งซ้ำอัตโนมัติเมื่อเปิดหน้าเว็บครั้งถัดไป
+        if (!saved) pkfQueuePendingOrder(orderRow, payload);
+
+        // 4. Meta Pixel Purchase: ยิงเฉพาะเมื่อยืนยันว่าบันทึกออเดอร์สำเร็จจริง
+        if (saved && typeof window.pkfTrackMetaEvent === 'function') {
           window.pkfTrackMetaEvent('Purchase', {
             content_name: p.name,
             content_ids: [p.sku],
@@ -1447,12 +1511,15 @@
           }, { eventID: orderId });
         }
 
-        // 4. Show Success Modal
+        // 5. Modal
         document.getElementById('modalOrderId').innerText = orderId;
         document.getElementById('modalSummary').innerHTML = `
           <div><b>สินค้า:</b> ${p.name}</div>
           <div><b>ยอดชำระสุทธิ:</b> ${totalPay.toLocaleString()} บาท (${currentPayment === 'COD' ? '🚚 เก็บเงินปลายทาง' : '💳 โอนเงิน'})</div>
           <div><b>ผู้รับ:</b> คุณ${name} (${phone})</div>
+          ${saved ? '' : `<div style="margin-top:10px; padding:10px; border-radius:10px; background:#fef3c7; color:#92400e; font-size:0.85rem;">
+            ⚠️ ระบบเครือข่ายขัดข้องชั่วคราว ออเดอร์ถูกเก็บไว้ในเครื่องและจะส่งซ้ำอัตโนมัติ<br>
+            เพื่อความชัวร์ กรุณาแคปหน้าจอนี้แล้วทัก LINE <b>@137gsref</b> แจ้งรหัส <b>${orderId}</b> ค่ะ</div>`}
         `;
         document.getElementById('successModal').style.display = 'flex';
         document.getElementById('orderForm').reset();
