@@ -1244,6 +1244,17 @@
       document.getElementById('stickyProdName').innerText = p.name;
       document.getElementById('stickyPriceText').innerText = `${p.price.toLocaleString()} บาท` + (p.shippingFee ? ` (+ส่ง ${p.shippingFee}.-)` : ' (ส่งฟรี)');
 
+      // Meta Pixel: Track AddToCart when customer selects a package
+      if (typeof window.pkfTrackMetaEvent === 'function') {
+        window.pkfTrackMetaEvent('AddToCart', {
+          content_name: p.name,
+          content_ids: [p.sku],
+          content_type: 'product',
+          value: totalPay,
+          currency: 'THB'
+        });
+      }
+
       // Smooth scroll to order section
       const orderSec = document.getElementById('order-section');
       if (orderSec) {
@@ -1371,7 +1382,11 @@
         price: p.price + (p.shippingFee || 0),
         payment_method: currentPayment,
         note: note,
-        slip_url: uploadedSlipUrl
+        slip_url: uploadedSlipUrl,
+        fbc: window.pkfFbc || localStorage.getItem('pkf_fbc') || null,
+        fbp: window.pkfFbp || localStorage.getItem('pkf_fbp') || null,
+        user_agent: navigator.userAgent,
+        event_source_url: window.location.href
       };
 
       try {
@@ -1404,8 +1419,8 @@
           })
         }).catch(err => console.log('Supa error:', err));
 
-        // 2. Google Apps Script Webhook (Telegram Push Alert only)
-        const gasUrl = 'https://script.google.com/macros/s/AKfycbxF3SRGu9KHAVh5vmk9rdTgsuqeH5lZsIpAfTFsLJDFVGtQipMSWq6TuD1spUP3yeRMew/exec';
+        // 2. Google Apps Script Webhook (Telegram Push Alert + Meta CAPI Server Event)
+        const gasUrl = 'https://script.google.com/macros/s/AKfycbxHAfBm0V67wkiXb1dlAFNbG3NQudcN35zuQ3xjFo0FRHY2ja8TB3-Xj0l_xOWxeF404Q/exec';
         const gasPromise = fetch(gasUrl, {
           method: 'POST',
           mode: 'no-cors',
@@ -1419,9 +1434,21 @@
           new Promise(resolve => setTimeout(resolve, 800))
         ]);
 
-        // 3. Show Success Modal
-        document.getElementById('modalOrderId').innerText = orderId;
+        // 3. Fire Meta Pixel Purchase Event (Deduplicated with Server CAPI via orderId)
         const totalPay = p.price + (p.shippingFee || 0);
+        if (typeof window.pkfTrackMetaEvent === 'function') {
+          window.pkfTrackMetaEvent('Purchase', {
+            content_name: p.name,
+            content_ids: [p.sku],
+            content_type: 'product',
+            value: totalPay,
+            currency: 'THB',
+            num_items: 1
+          }, { eventID: orderId });
+        }
+
+        // 4. Show Success Modal
+        document.getElementById('modalOrderId').innerText = orderId;
         document.getElementById('modalSummary').innerHTML = `
           <div><b>สินค้า:</b> ${p.name}</div>
           <div><b>ยอดชำระสุทธิ:</b> ${totalPay.toLocaleString()} บาท (${currentPayment === 'COD' ? '🚚 เก็บเงินปลายทาง' : '💳 โอนเงิน'})</div>
@@ -1445,6 +1472,16 @@
 
 
     function scrollToOrderForm() {
+      if (typeof window.pkfTrackMetaEvent === 'function') {
+        const p = PRODUCTS.find(x => x.sku === currentSelectedSku) || PRODUCTS[0];
+        window.pkfTrackMetaEvent('InitiateCheckout', {
+          content_name: p.name,
+          content_ids: [p.sku],
+          content_type: 'product',
+          value: p.price + (p.shippingFee || 0),
+          currency: 'THB'
+        });
+      }
       const orderCard = document.getElementById('orderForm');
       if (orderCard) {
         orderCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1454,6 +1491,109 @@
         }, 500);
       }
     }
+
+    // =========================================================================
+    // Meta Pixel + Conversions API (CAPI) + fbclid Attribution Engine
+    // =========================================================================
+    (function initMetaAttributionEngine() {
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        const fbclid = urlParams.get('fbclid');
+        if (fbclid) {
+          const fbcVal = 'fb.1.' + Date.now() + '.' + fbclid;
+          window.pkfFbc = fbcVal;
+          localStorage.setItem('pkf_fbc', fbcVal);
+        } else {
+          window.pkfFbc = localStorage.getItem('pkf_fbc') || null;
+        }
+
+        let fbpVal = localStorage.getItem('pkf_fbp');
+        if (!fbpVal) {
+          fbpVal = 'fb.1.' + Date.now() + '.' + Math.floor(1000000000 + Math.random() * 9000000000);
+          localStorage.setItem('pkf_fbp', fbpVal);
+        }
+        window.pkfFbp = fbpVal;
+
+        let checkoutTracked = false;
+        ['custName', 'custPhone', 'custAddress'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener('focus', function() {
+              if (!checkoutTracked && typeof window.pkfTrackMetaEvent === 'function') {
+                checkoutTracked = true;
+                const p = PRODUCTS.find(x => x.sku === currentSelectedSku) || PRODUCTS[0];
+                window.pkfTrackMetaEvent('InitiateCheckout', {
+                  content_name: p.name,
+                  content_ids: [p.sku],
+                  content_type: 'product',
+                  value: p.price + (p.shippingFee || 0),
+                  currency: 'THB'
+                });
+              }
+            }, { once: true });
+          }
+        });
+
+        window.pkfTrackMetaEvent = function(eventName, params, options) {
+          if (typeof window.fbq === 'function' && window.pkfPixelReady) {
+            if (options) {
+              window.fbq('track', eventName, params || {}, options);
+            } else {
+              window.fbq('track', eventName, params || {});
+            }
+          }
+        };
+
+        function loadFbPixelScript(pixelId) {
+          if (!pixelId || window.pkfPixelReady) return;
+          !function(f,b,e,v,n,t,s)
+          {if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+          n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+          if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+          n.queue=[];t=b.createElement(e);t.async=!0;
+          t.src=v;s=b.getElementsByTagName(e)[0];
+          s.parentNode.insertBefore(t,s)}(window, document,'script',
+          'https://connect.facebook.net/en_US/fbevents.js');
+
+          window.fbq('init', String(pixelId).trim());
+          window.pkfPixelReady = true;
+          window.fbq('track', 'PageView');
+          window.fbq('track', 'ViewContent', {
+            content_name: 'ปลาสลิดแดดเดียวสุพรรณบุรีแท้ ไซส์จัมโบ้ 6 ตัวโล ป้าเข็ม คัดพิเศษ',
+            content_ids: ['SKU-SLID-MD-500G', 'SKU-SLID-MD-1KG', 'SKU-SLID-MD-2KG'],
+            content_type: 'product_group',
+            value: 550,
+            currency: 'THB'
+          });
+        }
+
+        const paramPixel = urlParams.get('pixel_id');
+        if (paramPixel && /^\d{10,20}$/.test(paramPixel.trim())) {
+          localStorage.setItem('pkf_pixel_id', paramPixel.trim());
+          loadFbPixelScript(paramPixel.trim());
+        } else {
+          const cachedPixel = localStorage.getItem('pkf_pixel_id');
+          if (cachedPixel && /^\d{10,20}$/.test(cachedPixel)) {
+            loadFbPixelScript(cachedPixel);
+          }
+          // Fetch live Pixel ID from Supabase system_preferences (settable via Telegram /pixel)
+          const supaKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzcWh2dWpxbW54cXJkb292dm5wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQyOTc4NjAsImV4cCI6MjA2OTg3Mzg2MH0.3kCGGAe1OoSJ_SCN_NDSdnKep1hXIMgMxR1lBd_i2eI';
+          fetch('https://usqhvujqmnxqrdoovvnp.supabase.co/rest/v1/system_preferences?key=eq.meta_pixel_config&select=value', {
+            headers: { 'apikey': supaKey, 'Authorization': 'Bearer ' + supaKey }
+          })
+          .then(r => r.ok ? r.json() : [])
+          .then(rows => {
+            if (Array.isArray(rows) && rows.length > 0 && rows[0].value && rows[0].value.pixel_id) {
+              const livePixel = String(rows[0].value.pixel_id).trim();
+              if (/^\d{10,20}$/.test(livePixel)) {
+                localStorage.setItem('pkf_pixel_id', livePixel);
+                loadFbPixelScript(livePixel);
+              }
+            }
+          }).catch(() => {});
+        }
+      } catch (e) {}
+    })();
 
     // Sync mobile floating bar price when product selected
     function updateMobileFloatBar(product) {
